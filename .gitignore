@@ -1,0 +1,42 @@
+# Virtual Environment
+.venv/
+venv/
+env/
+ENV/
+
+# Python Cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.pytest_cache/
+.pytest_cache/
+
+# User Data, Logs, and Backups (Sensitive)
+profiles/
+backups/
+data/
+logs/
+*.log
+@AutomationLog.txt
+
+# SQLite Databases & Storage
+*.db
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.db-journal
+
+# Screenshots and Temporary Crops
+*.png
+*.jpg
+*.jpeg
+agent_shots/
+
+# Tools & Portable Binaries
+tools/
+
+# OS and IDE files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
