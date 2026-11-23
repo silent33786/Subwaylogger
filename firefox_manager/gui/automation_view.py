@@ -230,12 +230,12 @@ class AutomationView(QWidget):
         layout.addWidget(lbl)
 
         self.batch_text = QTextEdit()
+        # Placeholder shows the FORMAT only - never a real or
+        # example password value. Type your own accounts here.
         self.batch_text.setPlaceholderText(
-            "Example:\n"
-            "1000839201928:MyPass123\n"
-            "user1@gmail.com:StrongPassword#4\n"
-            "1000992837461|SecretPassword\n"
-            "fb_user_3:Pass789\n"
+            "Example format (type your own accounts, one per line):\n"
+            "<uid-or-email>:<password>\n"
+            "<uid-or-email>|<password>\n"
         )
         self.batch_text.setMinimumHeight(150)
         self.batch_text.setStyleSheet("""

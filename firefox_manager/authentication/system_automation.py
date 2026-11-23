@@ -175,8 +175,15 @@ class SystemLevelAutomation:
         self.set_clipboard("")
 
     def paste_into_focused_input(self, text: str) -> None:
-        """Copy exact text to clipboard, send Ctrl+V, and immediately erase clipboard."""
-        self.set_clipboard(text)
+        """Copy exact text to clipboard, send Ctrl+V, and immediately erase clipboard.
+
+        The old version ignored set_clipboard()'s return value, so if the
+        clipboard was busy it still sent Ctrl+V and pasted whatever stale
+        content (possibly the previous credential) was there. Now a
+        failed clipboard set raises instead of pasting the wrong thing.
+        """
+        if not self.set_clipboard(text):
+            raise RuntimeError("Could not set the clipboard - refusing to paste stale content.")
         time.sleep(0.08)
         self.send_ctrl_v()
         time.sleep(0.08)
@@ -353,7 +360,15 @@ class SystemLevelAutomation:
     def check_facebook_session_status(self, directory_name: str) -> Dict[str, Any]:
         """
         Inspect Firefox's persistent cookies.sqlite in read-only mode.
-        Returns whether the account has reached authenticated state or security checkpoint.
+        Returns whether the account has reached authenticated state.
+
+        Limitation, documented honestly: logged-in is decided ONLY by
+        the presence of Facebook's `c_user` session cookie. There is no
+        cookie literally named 'checkpoint' that reliably signals a
+        security checkpoint (the old code queried for one, so it almost
+        never detected a checkpoint from cookies). Checkpoint detection
+        must come from the window title / page state, checked by the
+        caller - see run_facebook_login_system_level().
         """
         profile_path = profile_storage.get_profile_path(directory_name)
         cookies_db = profile_path / "cookies.sqlite"
@@ -366,18 +381,19 @@ class SystemLevelAutomation:
             conn = sqlite3.connect(uri_path, uri=True, timeout=2.0)
             cur = conn.cursor()
             cur.execute(
-                "SELECT name, value FROM moz_cookies WHERE host LIKE ? AND name IN ('c_user', 'checkpoint')",
+                "SELECT name, value FROM moz_cookies WHERE host LIKE ? AND name = 'c_user'",
                 ("%facebook.com%",),
             )
             rows = dict(cur.fetchall())
             conn.close()
 
             c_user = rows.get("c_user")
-            has_checkpoint = "checkpoint" in rows
             return {
                 "logged_in": bool(c_user),
                 "c_user": c_user,
-                "has_checkpoint": has_checkpoint,
+                # Always False from cookies alone; callers detect a
+                # checkpoint from the window title instead.
+                "has_checkpoint": False,
             }
         except Exception:
             return {"logged_in": False, "c_user": None, "has_checkpoint": False}
@@ -443,14 +459,10 @@ class SystemLevelAutomation:
         if not hwnd:
             raise RuntimeError("Could not find visible Firefox window on the system.")
 
+        # 4. Focus the Firefox window once (this block was duplicated).
         log_step(f"Bringing Firefox window (HWND: {hwnd}) to foreground...")
         self.force_focus_window(hwnd)
         time.sleep(0.8)
-
-        # 4. Focus native Firefox window
-        log_step(f"Bringing Firefox window (HWND: {hwnd}) to foreground...")
-        self.force_focus_window(hwnd)
-        time.sleep(1.0)
 
         # 5. Dismiss any initial browser autocomplete or import prompts
         self.send_key(VK_ESCAPE)
@@ -478,46 +490,18 @@ class SystemLevelAutomation:
         self.send_key(VK_RETURN)
         time.sleep(1.2)
 
-        # 10. Save account record in DB and OS vault
-        log_step("Saving account record in database and secure vault...")
-        now_iso = datetime.now(timezone.utc).isoformat()
-        accounts = db.list_accounts()
-        fb_account = None
-
-        for a in accounts:
-            if a.service_name.lower() == "facebook" and a.username.lower() == username_or_uid.lower():
-                fb_account = a
-                break
-
-        if fb_account:
-            fb_account.profile_id = profile_id
-            fb_account.status = AccountStatus.ACTIVE
-            fb_account.last_login_at = now_iso
-            db.update_account(fb_account)
-        else:
-            fb_account = AccountRecord(
-                service_name="Facebook",
-                username=username_or_uid,
-                profile_id=profile_id,
-                status=AccountStatus.ACTIVE,
-                last_login_at=now_iso,
-                notes="Automated system-level sign-in",
-            )
-            db.create_account(fb_account)
-
-        if save_to_vault and password:
-            credential_manager.store_credential(
-                service_name="Facebook",
-                username=username_or_uid,
-                secret=password,
-            )
-
-        # 11. Real-time Monitoring: Watch until Facebook Home Page is reached or CAPTCHA appears
+        # 10. Real-time Monitoring: Watch until Facebook Home Page is
+        # reached or a CAPTCHA / checkpoint appears. NOTE: nothing is
+        # saved to the DB or vault here. The old code marked the account
+        # ACTIVE and stored the password BEFORE knowing whether the
+        # login had worked. Saving now happens only after
+        # home_page_reached is True (step 11 below).
         log_step("🔍 Monitoring post-login state: Waiting for Facebook Home Page to load...")
         monitor_start = time.time()
         max_wait_seconds = 45.0
         home_page_reached = False
         challenge_notified = False
+        verification_timed_out = False
 
         while (time.time() - monitor_start) < max_wait_seconds:
             time.sleep(1.5)
@@ -525,12 +509,15 @@ class SystemLevelAutomation:
             status = self.check_facebook_session_status(profile.directory_name)
             current_title = self.get_window_title(hwnd).lower()
 
-            # A. Check for CAPTCHA / 2FA / Security Checkpoint
+            # A. Check for CAPTCHA / 2FA / Security Checkpoint. The
+            # cookie check cannot detect a checkpoint (see
+            # check_facebook_session_status), so the window title is
+            # the signal here.
             challenge_keywords = [
                 "security check", "checkpoint", "two-factor", "confirm your identity",
                 "verification", "enter code", "captcha", "security code", "help us confirm"
             ]
-            is_challenge = any(kw in current_title for kw in challenge_keywords) or status.get("has_checkpoint", False)
+            is_challenge = any(kw in current_title for kw in challenge_keywords)
 
             if is_challenge and not challenge_notified:
                 challenge_notified = True
@@ -538,41 +525,127 @@ class SystemLevelAutomation:
                 log_step("👉 Human-in-the-Loop Protocol: Bringing Firefox to front. Please solve the challenge in the browser window.")
                 self.force_focus_window(hwnd)
 
+                # Human-in-the-loop: request verification AND WAIT for
+                # the user to resolve it. The old code fired the request
+                # and carried on looping, then returned success anyway.
+                # No CAPTCHA / 2FA code is ever entered by automation.
+                verification_request = None
                 try:
                     from firefox_manager.core.orchestrator import orchestrator
-                    orchestrator.verification_handler.request_human_verification(
+                    verification_request = orchestrator.verification_handler.request_human_verification(
                         profile_id=profile.id,
                         challenge_type="Facebook Security Checkpoint / CAPTCHA",
                         details="Facebook requested security verification. Please solve it in the open Firefox window.",
                     )
                 except Exception:
-                    pass
+                    verification_request = None
+
+                if verification_request is not None:
+                    log_step("⏸️ Paused: waiting up to 300s for you to complete the verification in Firefox...")
+                    resolved = verification_request.wait_for_resolution(timeout=300)
+                    if not resolved:
+                        verification_timed_out = True
+                        log_step("⏰ Verification was not completed within 300s.")
+                        break
+                    if not verification_request.success:
+                        log_step("Verification was marked as failed / cancelled by the user.")
+                        break
+                    log_step("✓ Verification resolved by the user. Re-checking login state...")
+                    challenge_notified = False  # re-arm: a second challenge is possible
+                    monitor_start = time.time()  # fresh 45s window after the user finishes
+                    continue
 
             # B. Check for Facebook Home Page Success
             # Case 1: Persistent c_user cookie confirmed
             if status.get("logged_in") and status.get("c_user"):
                 home_page_reached = True
-                log_step(f"🎉 Facebook Home Page Reached! Authenticated User: {status['c_user']}")
+                log_step("🎉 Facebook Home Page Reached! Authenticated session verified.")
                 log_step("✓ Automation Completed Successfully! Session is persistent.")
                 break
 
-            # Case 2: Title indicates Home Page and not login or challenge
-            if "facebook" in current_title and not any(kw in current_title for kw in ["log in", "login", "sign up", "log into"]) and not is_challenge:
+            # Case 2: Title indicates Home Page and not login or challenge.
+            # Title alone is weak evidence, so it only counts when the
+            # c_user cookie is also present (checked above) OR the title
+            # is exactly a home-page title with no login wording. The
+            # old code accepted any "facebook" title, including the
+            # login page itself, as success.
+            if (
+                current_title.strip() == "facebook"
+                and not is_challenge
+                and status.get("logged_in")
+            ):
                 home_page_reached = True
                 log_step("🎉 Facebook Home Page Reached! Automation Completed Successfully.")
                 break
 
-        if not home_page_reached:
-            if challenge_notified:
-                log_step("⚠️ Security challenge is active. Complete it in Firefox; session will be saved automatically.")
+        # 11. Save account record in DB and OS vault - ONLY after the
+        # login has actually been verified.
+        if home_page_reached:
+            log_step("Saving account record in database and secure vault...")
+            now_iso = datetime.now(timezone.utc).isoformat()
+            accounts = db.list_accounts()
+            fb_account = None
+
+            for a in accounts:
+                if a.service_name.lower() == "facebook" and a.username.lower() == username_or_uid.lower():
+                    fb_account = a
+                    break
+
+            if fb_account:
+                fb_account.profile_id = profile_id
+                fb_account.status = AccountStatus.ACTIVE
+                fb_account.last_login_at = now_iso
+                db.update_account(fb_account)
             else:
-                log_step("✓ Login submitted! Profile is active in front of you.")
+                fb_account = AccountRecord(
+                    service_name="Facebook",
+                    username=username_or_uid,
+                    profile_id=profile_id,
+                    status=AccountStatus.ACTIVE,
+                    last_login_at=now_iso,
+                    notes="Automated system-level sign-in",
+                )
+                db.create_account(fb_account)
+
+            if save_to_vault and password:
+                credential_manager.store_credential(
+                    service_name="Facebook",
+                    username=username_or_uid,
+                    secret=password,
+                )
+        else:
+            # Never mark ACTIVE / store the password for a login that
+            # did not verify. Record the attempt as needing login so
+            # the dashboard does not show a false "connected" account.
+            try:
+                accounts = db.list_accounts()
+                for a in accounts:
+                    if a.service_name.lower() == "facebook" and a.username.lower() == username_or_uid.lower():
+                        db.update_account_status(a.id, AccountStatus.REQUIRES_LOGIN)
+                        break
+            except Exception:
+                pass
+
+        if not home_page_reached:
+            if verification_timed_out:
+                message = "Verification not completed - login not verified."
+            elif challenge_notified:
+                message = "Security challenge is active - login not verified. Complete it in Firefox and retry."
+            else:
+                message = "Login not verified - home page was not reached."
+            log_step(f"⚠️ {message}")
+            return {
+                "success": False,
+                "pid": pid,
+                "home_page_reached": False,
+                "message": message,
+            }
 
         return {
             "success": True,
             "pid": pid,
-            "home_page_reached": home_page_reached,
-            "message": "Facebook Home Page reached & session verified." if home_page_reached else "Credentials submitted.",
+            "home_page_reached": True,
+            "message": "Facebook Home Page reached & session verified.",
         }
 
     def run_batch_facebook_automation(
@@ -601,8 +674,15 @@ class SystemLevelAutomation:
                 details=msg,
             )
 
+        # Parse each line on its FIRST separator only. The old code tried
+        # separators in order (":", "|", tab, ",") and split on whichever
+        # appeared first in the line, so a password containing ":" was
+        # split at the wrong place. Splitting on the first separator
+        # only is still ambiguous if a password contains the separator,
+        # so the file format is: first separator separates user/pass.
         parsed_accounts = []
-        for raw_line in account_lines:
+        skipped_lines: List[Dict[str, Any]] = []
+        for line_no, raw_line in enumerate(account_lines, start=1):
             line = raw_line.strip()
             if not line or line.startswith("#"):
                 continue
@@ -615,8 +695,15 @@ class SystemLevelAutomation:
                     pass_part = parts[1].strip()
                     break
 
-            if user_part and pass_part:
-                parsed_accounts.append((user_part, pass_part))
+            # Was: lines with an empty user or password were silently
+            # dropped. Now they are reported as skipped entries.
+            if not user_part or not pass_part:
+                skipped_lines.append(
+                    {"line": line_no, "success": False,
+                     "error": "Skipped: empty username or password on this line."}
+                )
+                continue
+            parsed_accounts.append((user_part, pass_part))
 
         total = len(parsed_accounts)
         if total == 0:
@@ -625,14 +712,33 @@ class SystemLevelAutomation:
             )
 
         log_step(f"🚀 Loaded {total} account(s) for automatic profile creation and login.")
-        results = []
+        if skipped_lines:
+            log_step(f"⚠️ {len(skipped_lines)} line(s) skipped (empty username or password).")
+        results: List[Dict[str, Any]] = list(skipped_lines)
 
+        previous_profile_id: Optional[str] = None
         for idx, (username_or_uid, password) in enumerate(parsed_accounts, start=1):
             if progress_callback:
                 progress_callback(idx, total)
 
             log_step("=" * 55)
             log_step(f"[{idx}/{total}] Processing Account: {username_or_uid}")
+
+            # Stop the previous account's Firefox before starting the
+            # next one. The old code never stopped it, so profiles
+            # piled up until the max-concurrent limit was hit and
+            # later accounts failed. Also enforce the limit up front.
+            if previous_profile_id and process_manager.is_running(previous_profile_id):
+                log_step(f"Stopping previous profile's Firefox before starting the next account...")
+                try:
+                    process_manager.stop_profile_process(previous_profile_id)
+                except Exception as e:
+                    log_step(f"⚠️ Could not stop previous Firefox: {e}")
+            if process_manager.get_active_count() >= settings.max_concurrent_profiles:
+                results.append({"user": username_or_uid, "success": False,
+                                "error": f"Maximum concurrent profiles ({settings.max_concurrent_profiles}) reached."})
+                log_step(f"❌ Skipped account {idx}/{total}: concurrent-profile limit reached.")
+                continue
 
             # 1. Automatic Profile Resolution or Creation
             clean_name = f"FB_{username_or_uid.replace('@', '_').replace('.', '_')}"
@@ -655,7 +761,10 @@ class SystemLevelAutomation:
                 profile = existing_profile
                 log_step(f"Using existing dedicated profile '{clean_name}'")
 
-            # 2. Run OS-level login
+            # 2. Run OS-level login. Was: every non-exception return was
+            # recorded as success, even when the login had not verified.
+            # Now the per-account result follows the login result.
+            previous_profile_id = profile.id
             try:
                 res = self.run_facebook_login_system_level(
                     profile_id=profile.id,
@@ -665,8 +774,13 @@ class SystemLevelAutomation:
                     status_callback=status_callback,
                     save_to_vault=True,
                 )
-                results.append({"user": username_or_uid, "success": True, "profile": clean_name})
-                log_step(f"✓ Completed account {idx}/{total} ({username_or_uid})")
+                ok = bool(res.get("success"))
+                results.append({"user": username_or_uid, "success": ok, "profile": clean_name,
+                                **({} if ok else {"error": res.get("message", "Login not verified.")})})
+                if ok:
+                    log_step(f"✓ Completed account {idx}/{total} ({username_or_uid})")
+                else:
+                    log_step(f"❌ Login not verified for account {idx}/{total} ({username_or_uid}): {res.get('message')}")
             except Exception as e:
                 log_step(f"❌ Error during login for {username_or_uid}: {e}")
                 results.append({"user": username_or_uid, "success": False, "error": str(e)})

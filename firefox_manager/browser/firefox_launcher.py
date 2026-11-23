@@ -10,7 +10,11 @@ import sys
 import ctypes
 from pathlib import Path
 from typing import Optional, List
-import winreg
+
+try:
+    import winreg
+except ImportError:  # Not Windows (or no winreg): registry lookup is unavailable.
+    winreg = None  # type: ignore[assignment]
 
 from firefox_manager.config.settings import settings
 
@@ -19,11 +23,19 @@ class FirefoxLauncher:
     """Manages direct execution of native local Firefox instances."""
 
     def __init__(self, executable_path: Optional[str] = None):
+        # Do NOT raise here. Importing the app (or running --status /
+        # --help / tests) must work on a machine without Firefox. The
+        # missing-binary error is raised only in launch(), with a clear
+        # message telling the user how to fix it.
         self.executable_path = executable_path or self.detect_firefox_binary()
+        self._missing_binary_error: Optional[str] = None
         if not self.executable_path or not os.path.isfile(self.executable_path):
-            raise FileNotFoundError(
-                f"Firefox executable could not be found. Checked path: {self.executable_path}"
+            self._missing_binary_error = (
+                "Firefox executable could not be found. Install Firefox, or set "
+                "the FIREFOX_BINARY environment variable to the full path of "
+                f"firefox.exe. Checked path: {self.executable_path}"
             )
+            self.executable_path = None
 
     @classmethod
     def detect_firefox_binary(cls) -> Optional[str]:
@@ -32,21 +44,21 @@ class FirefoxLauncher:
         if settings.firefox_binary_path and os.path.isfile(settings.firefox_binary_path):
             return str(Path(settings.firefox_binary_path).resolve())
 
-        # Check Windows App Paths Registry
-        registry_keys = [
-            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\firefox.exe"),
-            (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\firefox.exe"),
-            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\firefox.exe"),
-        ]
-
-        for hkey, subkey in registry_keys:
-            try:
-                with winreg.OpenKey(hkey, subkey) as key:
-                    val, _ = winreg.QueryValueEx(key, "")
-                    if val and os.path.isfile(val):
-                        return str(Path(val).resolve())
-            except OSError:
-                pass
+        # Check Windows App Paths Registry (Windows only)
+        if winreg is not None:
+            registry_keys = [
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\firefox.exe"),
+                (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\firefox.exe"),
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\firefox.exe"),
+            ]
+            for hkey, subkey in registry_keys:
+                try:
+                    with winreg.OpenKey(hkey, subkey) as key:
+                        val, _ = winreg.QueryValueEx(key, "")
+                        if val and os.path.isfile(val):
+                            return str(Path(val).resolve())
+                except OSError:
+                    pass
 
         # Standard file path fallbacks
         candidates = [
@@ -72,6 +84,11 @@ class FirefoxLauncher:
         Launch Firefox natively bound to the specified isolated profile directory.
         Uses official '-profile' and '-no-remote' flags to guarantee profile isolation.
         """
+        if not self.executable_path:
+            raise FileNotFoundError(
+                self._missing_binary_error
+                or "Firefox executable could not be found. Install Firefox or set FIREFOX_BINARY."
+            )
         resolved_profile = Path(profile_path).resolve()
         if not resolved_profile.is_dir():
             raise FileNotFoundError(f"Profile directory does not exist: {resolved_profile}")
@@ -142,4 +159,3 @@ class FirefoxLauncher:
             return True
 
         return False
-

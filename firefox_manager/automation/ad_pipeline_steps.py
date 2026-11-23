@@ -8,10 +8,13 @@ Uses 100% native untouched Firefox profiles with:
 """
 
 import time
-import random
 from pathlib import Path
 from typing import Optional, Callable, Dict, Any, List
-import win32gui
+
+try:
+    import win32gui
+except ImportError:  # pywin32 not installed / not Windows: guarded at call time.
+    win32gui = None  # type: ignore[assignment]
 
 from firefox_manager.authentication.system_automation import (
     system_automation,
@@ -32,14 +35,11 @@ EU_COUNTRIES = {
     "united kingdom", "uk"
 }
 
-RANDOM_PAYEE_NAMES = [
-    "Nova Horizon Media Ltd",
-    "Apex Commerce Solutions",
-    "Vanguard Digital Group",
-    "Starlight Ventures LLC",
-    "Atlas Global Marketing",
-    "Crestline Enterprises",
-]
+# NOTE: there used to be a RANDOM_PAYEE_NAMES list here and the code
+# picked a random fake company as the EU payee. That has been removed:
+# inventing a legal payee / beneficiary name for an EU ad is a false
+# compliance declaration. If an EU country is targeted and no real
+# payee_name is supplied, AudienceBudgetStep now raises ValueError.
 
 
 class StepContext:
@@ -67,6 +67,8 @@ class StepContext:
         return SmartLocator(self.hwnd, step_name)
 
     def window_geometry(self):
+        if win32gui is None:
+            raise RuntimeError("Window geometry needs Windows + pywin32.")
         rect = win32gui.GetWindowRect(self.hwnd)
         base_x = max(0, rect[0])
         base_y = max(0, rect[1])
@@ -108,8 +110,13 @@ class BaseAdStep:
         raise NotImplementedError
 
     def verify(self, ctx: StepContext) -> bool:
-        """Verify that step achieved desired outcome."""
-        return True
+        """Verify that step achieved desired outcome.
+
+        Base default is False: a step that never implemented verify()
+        must fail loudly, not silently report success. Every real step
+        overrides this with a check on an observable.
+        """
+        return False
 
 
 # =============================================================================
@@ -120,7 +127,7 @@ class ProfileResolutionStep(BaseAdStep):
     description = "Profile Resolution & Security Check"
 
     def is_done(self, ctx: StepContext) -> bool:
-        return ctx.hwnd is not None and win32gui.IsWindow(ctx.hwnd)
+        return ctx.hwnd is not None and win32gui is not None and bool(win32gui.IsWindow(ctx.hwnd))
 
     def execute(self, ctx: StepContext) -> None:
         ctx.log_step("Asserting native Firefox window focus and responsiveness...")
@@ -130,7 +137,7 @@ class ProfileResolutionStep(BaseAdStep):
 
     def verify(self, ctx: StepContext) -> bool:
         ctx.check_for_checkpoint()
-        return ctx.hwnd is not None and win32gui.IsWindow(ctx.hwnd)
+        return ctx.hwnd is not None and win32gui is not None and bool(win32gui.IsWindow(ctx.hwnd))
 
 
 # =============================================================================
@@ -184,7 +191,18 @@ class UnlockProfileStep(BaseAdStep):
             ctx.log_step("✓ Profile is open and NOT locked.")
 
     def verify(self, ctx: StepContext) -> bool:
+        # Honest check (was: unconditional True). The step only passes
+        # if the "Unlock profile" control is no longer present.
         ctx.check_for_checkpoint()
+        if not getattr(ctx.config, "unlock_profile_if_locked", True):
+            return True
+        loc = ctx.locator(self.name)
+        still_locked = loc.is_present(
+            ["uia=Button:Unlock profile", "uia=Text:Unlock profile"], timeout=0.8
+        )
+        if still_locked:
+            ctx.log_step("Unlock verification failed: 'Unlock profile' is still present.")
+            return False
         return True
 
 
@@ -258,8 +276,15 @@ class ProfessionalModeStep(BaseAdStep):
         ctx.log_step("✓ Professional Mode activation sequence completed.")
 
     def verify(self, ctx: StepContext) -> bool:
+        # Honest check (was: unconditional True). Pro Mode only passes
+        # if it is disabled in config or actually detectable as active.
         ctx.check_for_checkpoint()
-        return True
+        if not ctx.config.enable_pro_mode:
+            return True
+        if self.is_done(ctx):
+            return True
+        ctx.log_step("Professional Mode verification failed: no Professional dashboard indicator found.")
+        return False
 
 
 # =============================================================================
@@ -337,7 +362,11 @@ class NavigateAdCenterStep(BaseAdStep):
         restriction = smart_vision.check_facebook_ad_restrictions(ctx.hwnd)
         if restriction:
             raise PolicyRestrictionError(restriction)
-        return True
+        # Was: unconditional True, so the engine continued as if the ad
+        # form were open even when it never appeared. Now: False, so the
+        # engine retries / fails instead of pretending success.
+        ctx.log_step("Ad Center verification failed: ad creation form is not active.")
+        return False
 
 
 # =============================================================================
@@ -386,8 +415,27 @@ class SetGoalStep(BaseAdStep):
         ctx.log_step("✓ Goal objective confirmed: 'Get more website visitors'.")
 
     def verify(self, ctx: StepContext) -> bool:
+        # Honest check (was: unconditional True). The goal step passes
+        # only if the ad form is still active and the selected goal is
+        # observable on screen. Value-level confirmation of the goal card
+        # is not possible without DOM access in native mode; that limit
+        # is logged, not hidden behind a True.
         ctx.check_for_checkpoint()
-        return True
+        if not smart_vision.is_ad_creation_page_active(ctx.hwnd):
+            ctx.log_step("Goal verification failed: ad creation form is no longer active.")
+            return False
+        loc = ctx.locator(self.name)
+        if loc.is_present(
+            ["uia=Text:Get more website visitors", "uia=RadioButton:Get more website visitors"],
+            timeout=0.8,
+        ):
+            return True
+        ctx.log_step(
+            "Goal verification: goal text not observable via UIA (native mode has no DOM "
+            "access). Treating the still-active ad form as the check - re-check the goal "
+            "in Firefox before publishing."
+        )
+        return smart_vision.is_ad_creation_page_active(ctx.hwnd)
 
 
 # =============================================================================
@@ -459,6 +507,9 @@ class FillCreativeStep(BaseAdStep):
             "uia=ComboBox:Button",
             "coord=0.35,0.235",
         ]
+        # Was: bare `except: pass` - a failed CTA was silently ignored
+        # and the step still reported success. Now it is logged and
+        # re-raised so the step fails and the engine can retry / stop.
         try:
             loc.click(cta_cands, timeout=1.5)
             time.sleep(0.5)
@@ -466,8 +517,9 @@ class FillCreativeStep(BaseAdStep):
             time.sleep(0.2)
             system_automation.send_key(VK_RETURN)
             time.sleep(0.5)
-        except Exception:
-            pass
+        except Exception as e:
+            ctx.log_step(f"CTA configuration failed: {e}")
+            raise
 
         # 5. Website Destination URL
         ctx.log_step(f"Setting Destination Website URL: {ctx.config.target_url}")
@@ -479,7 +531,23 @@ class FillCreativeStep(BaseAdStep):
         time.sleep(0.5)
 
     def verify(self, ctx: StepContext) -> bool:
+        # Honest check (was: unconditional True). Passes only if the ad
+        # form is still active and the creative fields are present.
+        # Value-level confirmation (exact headline / URL text) is not
+        # possible without DOM access in native mode; that limit is
+        # logged rather than hidden behind a True.
         ctx.check_for_checkpoint()
+        if not smart_vision.is_ad_creation_page_active(ctx.hwnd):
+            ctx.log_step("Creative verification failed: ad creation form is no longer active.")
+            return False
+        loc = ctx.locator(self.name)
+        fields_present = loc.is_present(
+            ["uia=Edit:Headline", "uia=Edit:Description", "uia=Edit:Primary text"],
+            timeout=0.8,
+        )
+        if not fields_present:
+            ctx.log_step("Creative verification failed: headline/description fields not found.")
+            return False
         return True
 
 
@@ -500,11 +568,18 @@ class AudienceBudgetStep(BaseAdStep):
         ctx.scroll_mouse(ctx.hwnd, panel_x, panel_y, ticks=-5)
         time.sleep(1.0)
 
-        # European Payee Compliance
+        # European Payee Compliance. Never invent a payee: a random fake
+        # company name was previously used as the legal beneficiary.
+        # If an EU country is targeted, a real payee_name is required.
         is_eu_targeted = any(c.lower().strip() in EU_COUNTRIES for c in ctx.config.target_countries)
         if is_eu_targeted:
-            payee = ctx.config.payee_name or random.choice(RANDOM_PAYEE_NAMES)
-            ctx.log_step(f"🇪🇺 European Target detected. Applying compliance declaration payee: '{payee}'")
+            if not ctx.config.payee_name or not ctx.config.payee_name.strip():
+                raise ValueError(
+                    "EU country targeted but no payee_name supplied. Supply your real "
+                    "legal payee / beneficiary name in AutoAdsConfig.payee_name - "
+                    "the automation will not invent one."
+                )
+            ctx.log_step(f"🇪🇺 European Target detected. Using supplied payee: '{ctx.config.payee_name}'")
 
         # Daily Budget
         ctx.log_step(f"Setting Daily Budget: ${ctx.config.daily_budget:.2f} for {ctx.config.duration_days} days.")
@@ -517,7 +592,17 @@ class AudienceBudgetStep(BaseAdStep):
         time.sleep(0.5)
 
     def verify(self, ctx: StepContext) -> bool:
+        # Honest check (was: unconditional True). Passes only if the ad
+        # form is still active and the budget field is present. The
+        # amount itself cannot be read back without DOM access.
         ctx.check_for_checkpoint()
+        if not smart_vision.is_ad_creation_page_active(ctx.hwnd):
+            ctx.log_step("Budget verification failed: ad creation form is no longer active.")
+            return False
+        loc = ctx.locator(self.name)
+        if not loc.is_present(["uia=Edit:Daily budget"], timeout=0.8):
+            ctx.log_step("Budget verification failed: daily-budget field not found.")
+            return False
         return True
 
 
@@ -554,6 +639,12 @@ class PublishStep(BaseAdStep):
                 "Security checkpoint, verification, or payment method setup required in Firefox.",
                 challenge_type="verification_or_payment"
             )
+        # Honest check (was: unconditional True after the challenge
+        # check). If the ad form is still active, Publish did not go
+        # through - fail so the engine retries instead of claiming success.
+        if smart_vision.is_ad_creation_page_active(ctx.hwnd):
+            ctx.log_step("Publish verification failed: ad creation form is still active after Publish.")
+            return False
         return True
 
 

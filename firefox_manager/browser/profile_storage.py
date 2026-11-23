@@ -20,9 +20,38 @@ class ProfileStorageManager:
         self.base_dir = Path(profiles_base_dir or settings.profiles_dir).resolve()
         self.base_dir.mkdir(parents=True, exist_ok=True)
 
+    @staticmethod
+    def _validate_directory_name(directory_name: str) -> str:
+        """Reject anything that could escape the profiles directory.
+
+        The old code joined the name straight onto base_dir and resolved
+        it, so a name like "../something" or an absolute path could make
+        create / delete operate outside profiles/ - including, via
+        delete_profile_directory, wiping an arbitrary folder.
+        """
+        if not directory_name or not isinstance(directory_name, str):
+            raise ValueError("Profile directory name must be a non-empty string.")
+        if (
+            directory_name != directory_name.strip()
+            or "/" in directory_name
+            or "\\" in directory_name
+            or directory_name in (".", "..")
+            or ".." in directory_name
+            or Path(directory_name).is_absolute()
+        ):
+            raise ValueError(
+                f"Invalid profile directory name: {directory_name!r}. "
+                "Must be a single plain folder name (no /, \\, .. or absolute path)."
+            )
+        return directory_name
+
     def get_profile_path(self, directory_name: str) -> Path:
-        """Resolve absolute path to a profile directory."""
-        return (self.base_dir / directory_name).resolve()
+        """Resolve absolute path to a profile directory (validated, inside base_dir)."""
+        name = self._validate_directory_name(directory_name)
+        resolved = (self.base_dir / name).resolve()
+        if resolved.parent != self.base_dir.resolve():
+            raise ValueError(f"Profile directory name escapes the profiles folder: {name!r}")
+        return resolved
 
     def profile_exists(self, directory_name: str) -> bool:
         """Check if profile directory exists on disk."""
@@ -114,25 +143,50 @@ class ProfileStorageManager:
         user_js_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     def _configure_proxy_prefs(self, prefs: dict, proxy_str: str) -> None:
-        """Configure Firefox manual proxy preferences."""
-        clean = proxy_str.replace("http://", "").replace("https://", "").replace("socks5://", "")
-        parts = clean.split(":")
-        if len(parts) == 2:
-            host, port_str = parts[0], parts[1]
-            try:
-                port = int(port_str)
-                prefs["network.proxy.type"] = 1  # Manual proxy configuration
-                if "socks5://" in proxy_str:
-                    prefs["network.proxy.socks"] = host
-                    prefs["network.proxy.socks_port"] = port
-                    prefs["network.proxy.socks_version"] = 5
-                else:
-                    prefs["network.proxy.http"] = host
-                    prefs["network.proxy.http_port"] = port
-                    prefs["network.proxy.ssl"] = host
-                    prefs["network.proxy.ssl_port"] = port
-            except ValueError:
-                pass
+        """Configure Firefox manual proxy preferences.
+
+        Accepted: host:port, http://host:port, https://host:port,
+        socks5://host:port, user:pass@host:port (any scheme),
+        and IPv6 [::1]:port. The old code split naively on ":" and
+        silently did nothing for user:pass@ and IPv6 forms, leaving the
+        profile with no proxy and no error. Unparseable input now raises
+        ValueError with a clear message instead of being silently ignored.
+        (Proxy credentials are stored only in the profile's user.js as
+        Firefox requires for proxy auth; prefer IP-allowlisted proxies.)
+        """
+        from urllib.parse import urlparse
+
+        raw = (proxy_str or "").strip()
+        if not raw:
+            raise ValueError("Proxy string is empty.")
+        scheme = "http"
+        rest = raw
+        for prefix in ("socks5://", "socks://", "http://", "https://"):
+            if raw.lower().startswith(prefix):
+                scheme = "socks5" if prefix.startswith("socks") else "http"
+                rest = raw[len(prefix):]
+                break
+        # urlparse handles user:pass@host:port and [ipv6]:port correctly.
+        parsed = urlparse(f"//{rest}")
+        host = parsed.hostname
+        port = parsed.port
+        if not host or port is None:
+            raise ValueError(
+                f"Could not parse proxy {proxy_str!r}. Expected host:port, "
+                "scheme://host:port, user:pass@host:port or [ipv6]:port."
+            )
+        if not (1 <= port <= 65535):
+            raise ValueError(f"Proxy port out of range in {proxy_str!r}.")
+        prefs["network.proxy.type"] = 1  # Manual proxy configuration
+        if scheme == "socks5":
+            prefs["network.proxy.socks"] = host
+            prefs["network.proxy.socks_port"] = port
+            prefs["network.proxy.socks_version"] = 5
+        else:
+            prefs["network.proxy.http"] = host
+            prefs["network.proxy.http_port"] = port
+            prefs["network.proxy.ssl"] = host
+            prefs["network.proxy.ssl_port"] = port
 
     def is_profile_locked(self, directory_name: str) -> bool:
         """
@@ -191,14 +245,18 @@ class ProfileStorageManager:
     def delete_profile_directory(self, directory_name: str, max_retries: int = 8) -> bool:
         """
         Permanently delete profile folder from the system disk.
-        Aggressively strips read-only attributes, terminates residual locks,
-        and uses PowerShell & cmd force-removal to ensure zero junk files remain.
+
+        Uses shutil.rmtree only. The old code also ran a cmd.exe
+        rd command through a shell and a PowerShell Remove-Item with
+        the path interpolated into a command string - a shell-injection
+        hole if a directory name ever contained a quote, and
+        unnecessary: rmtree with a read-only handler does the same job
+        without a shell.
         """
         import stat
-        import subprocess
         import time
 
-        profile_path = self.get_profile_path(directory_name)
+        profile_path = self.get_profile_path(directory_name)  # validates the name
         if not profile_path.exists():
             return True
 
@@ -209,8 +267,8 @@ class ProfileStorageManager:
             except Exception:
                 pass
 
-        for attempt in range(max_retries):
-            # 1. Strip read-only attributes recursively
+        for _attempt in range(max_retries):
+            # Strip read-only attributes recursively, then rmtree.
             for root, dirs, files in os.walk(profile_path):
                 for d in dirs:
                     try:
@@ -223,41 +281,12 @@ class ProfileStorageManager:
                     except OSError:
                         pass
 
-            # 2. Try shutil.rmtree
             try:
                 shutil.rmtree(profile_path, onerror=_clear_readonly)
                 if not profile_path.exists():
                     return True
             except Exception:
                 pass
-
-            # 3. Windows cmd force removal
-            if os.name == "nt":
-                try:
-                    subprocess.run(
-                        f'cmd.exe /c rd /s /q "{profile_path}"',
-                        shell=True,
-                        capture_output=True,
-                        timeout=5,
-                    )
-                except Exception:
-                    pass
-
-                if not profile_path.exists():
-                    return True
-
-                # 4. PowerShell Force Removal
-                try:
-                    subprocess.run(
-                        ["powershell", "-NoProfile", "-Command", f'Remove-Item -LiteralPath "{profile_path}" -Recurse -Force -ErrorAction SilentlyContinue'],
-                        capture_output=True,
-                        timeout=5,
-                    )
-                except Exception:
-                    pass
-
-                if not profile_path.exists():
-                    return True
 
             time.sleep(0.6)
 

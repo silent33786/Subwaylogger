@@ -40,3 +40,19 @@ tools/
 Thumbs.db
 .idea/
 .vscode/
+
+# Secrets - never commit these. Passwords are only accepted via
+# FB_PASSWORD env var, getpass() prompt, or the OS vault.
+.env
+*.env
+.env.*
+!.env.example
+vault.key
+vault.enc
+agent_memory.json
+agent_memory.json.tmp
+# Local manual smoke test - it handles real credentials (env/getpass only)
+test_no_mouse.py
+# Any local account list used with --batch-fb
+accounts.txt
+*.accounts.txt

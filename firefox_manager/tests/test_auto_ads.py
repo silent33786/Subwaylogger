@@ -6,7 +6,8 @@ import pytest
 from pathlib import Path
 
 from firefox_manager.automation.auto_ads_models import AutoAdsConfig
-from firefox_manager.automation.auto_ads_engine import auto_ads_engine, EU_COUNTRIES, RANDOM_PAYEE_NAMES
+from firefox_manager.automation.auto_ads_engine import auto_ads_engine
+from firefox_manager.automation.ad_pipeline_steps import EU_COUNTRIES
 from firefox_manager.automation.ad_agent_memory import AdAgentMemory
 from firefox_manager.automation.ad_agent_recovery import (
     AdAgentRecovery,
@@ -41,11 +42,21 @@ def test_auto_ads_config_validation():
 
 
 def test_eu_compliance_rules():
-    """Verify EU country detection triggers compliance naming."""
+    """Verify EU country detection, and that no fake payee is invented.
+
+    The old code picked a random fake company name as the EU payee.
+    That list has been removed: targeting the EU without a real
+    payee_name must raise, and the engine must not invent one.
+    """
     assert "germany" in EU_COUNTRIES
     assert "france" in EU_COUNTRIES
     assert "united kingdom" in EU_COUNTRIES
-    assert len(RANDOM_PAYEE_NAMES) >= 5
+    # No fake-payee names exist anywhere in the pipeline any more.
+    import firefox_manager.automation.ad_pipeline_steps as steps
+    import firefox_manager.automation.auto_ads_engine as engine
+
+    assert not hasattr(steps, "RANDOM_PAYEE_NAMES")
+    assert not hasattr(engine, "RANDOM_PAYEE_NAMES")
 
 
 def test_engine_initialization():

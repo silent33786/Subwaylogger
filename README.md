@@ -164,9 +164,20 @@ pip install -r requirements.txt
 .\.venv\Scripts\python.exe -m firefox_manager.main --stop-profile "<PROFILE_ID>"
 
 # Permanent Profile Deletion (Deletes from DB and completely wipes physical directory from disk)
+.\.venv\Scripts\python.exe -m firefox_manager.main --delete-profile "<PROFILE_ID>"
 
 # Native OS-Level Facebook Automated Login (Zero WebDrivers, Untouched Browser)
-.\.venv\Scripts\python.exe -m firefox_manager.main --fb-login --profile "<PROFILE_ID>" --uid "<FB_UID_OR_EMAIL>" --password "<FB_PASSWORD>"
+# The password is NEVER passed on the command line. Set it in the
+# environment, or leave it unset and you will be prompted securely:
+#   $env:FB_PASSWORD = "your-password"   # PowerShell (session only)
+#   .\.venv\Scripts\python.exe -m firefox_manager.main --fb-login --profile "<PROFILE_ID>" --uid "<FB_UID_OR_EMAIL>"
+# If FB_PASSWORD is not set, the CLI prompts with getpass (hidden input).
+# The old --password argument has been removed.
+.\.venv\Scripts\python.exe -m firefox_manager.main --fb-login --profile "<PROFILE_ID>" --uid "<FB_UID_OR_EMAIL>"
+
+# Batch login from a file only (one UID:Password per line, file path only -
+# inline credentials on the command line are refused)
+.\.venv\Scripts\python.exe -m firefox_manager.main --batch-fb "C:\path\to\accounts.txt"
 
 # Create database backup snapshot
 .\.venv\Scripts\python.exe -m firefox_manager.main --backup
@@ -181,5 +192,15 @@ Run the full pytest suite:
 .\.venv\Scripts\pytest.exe -v
 ```
 
-All 15 unit and integration tests validate profile creation, isolation, session persistence, credential security, database backups, and human-in-the-loop challenge resolution.
+All 23 unit and integration tests validate profile creation, isolation, session persistence, credential security, database backups, and human-in-the-loop challenge resolution.
+
+## 7. Security
+
+- **Leaked credential (must act now):** an earlier version of this repo contained a real Facebook login in plain text in `test_no_mouse.py`. That file has been replaced with a safe template that reads credentials only from the `FB_UID` / `FB_PASSWORD` environment variables or a `getpass()` prompt.
+  1. **Change that Facebook password immediately** - it was in a public repository.
+  2. **Purge it from git history** - deleting the file in a new commit is not enough; the old value is still in history. Use `git filter-repo` (or BFG Repo-Cleaner) to remove the file from all history, then force-push and rotate any other credentials that were in the repo.
+  3. Check GitHub's secret-scanning / push-protection alerts for the repo.
+- **Never commit credentials.** `.env` files, `vault.key`, `vault.enc`, `agent_memory.json`, and `test_no_mouse.py` are all in `.gitignore`. Passwords are accepted only via `FB_PASSWORD`, a `getpass()` prompt, or the OS vault - never as a CLI argument, never hardcoded, never logged.
+- **Human-in-the-loop:** when Facebook shows a CAPTCHA, checkpoint, or 2FA challenge, automation pauses and waits (up to 300s) for you to solve it in the Firefox window. It never auto-solves CAPTCHAs and never enters verification codes. A login is only marked ACTIVE after the home page / session cookie is actually verified.
+- **Vault key:** the AES fallback vault key is stored in the OS credential store (keyring) when available. A file fallback (`data/.vault/vault.key`, owner-only permissions) is used only when keyring is unavailable and is weaker - anyone who can read that folder can decrypt the vault, so prefer a machine with Windows Credential Manager.
 

@@ -3,14 +3,24 @@ Native Firefox Smart Element Locator with Self-Learning Memory.
 Works with 100% untouched native Firefox profiles:
 1. SmartVision computer-vision color cluster recognition (Primary Blue & Secondary Grey buttons)
 2. UIAutomation accessibility element inspection
-3. Standardized maximized window layout anchors
+3. Standardized maximized window layout anchors (LAST RESORT ONLY)
+
+Coordinate candidates are never an auto-success: they are tried only
+after every colour/UIA candidate has failed, and the caller must still
+verify the result after clicking. A coordinate always "resolves", so
+treating it as a found element used to click blindly at the wrong place.
 All candidate strategies are ranked dynamically per step by historical success rate.
 """
 
+import re
 import time
 import logging
 from typing import Optional, Tuple, List, Dict, Any
-import win32gui
+
+try:
+    import win32gui
+except ImportError:  # pywin32 not installed / not Windows: guarded at call time.
+    win32gui = None  # type: ignore[assignment]
 
 from firefox_manager.authentication.system_automation import (
     system_automation,
@@ -34,8 +44,15 @@ class SmartLocator:
         self.hwnd = hwnd
         self.step_name = step_name
 
+    def _require_win32gui(self) -> None:
+        if win32gui is None:
+            raise RuntimeError(
+                "SmartLocator needs Windows + pywin32 (pip install pywin32)."
+            )
+
     def _get_window_geometry(self) -> Tuple[int, int, int, int]:
         """Obtain current window left, top, width, height."""
+        self._require_win32gui()
         rect = win32gui.GetWindowRect(self.hwnd)
         base_x = max(0, rect[0])
         base_y = max(0, rect[1])
@@ -43,18 +60,26 @@ class SmartLocator:
         h = max(600, rect[3] - rect[1])
         return base_x, base_y, w, h
 
-    def _resolve_candidate(self, cand: str, timeout: float = 1.0) -> Optional[Tuple[int, int]]:
+    def _resolve_candidate(
+        self, cand: str, timeout: float = 1.0, deadline: Optional[float] = None
+    ) -> Optional[Tuple[int, int]]:
         """
         Attempt to resolve a candidate descriptor to screen coordinates (x, y).
         - 'color=blue:0.4,0.6,0.7,0.85' -> Primary blue button search via computer vision
         - 'color=grey:0.4,0.14,0.55,0.26' -> Secondary grey button search
         - 'uia=Button:Turn on' -> UIAutomation search
-        - 'coord=0.82,0.365' -> Maximized window relative ratio
+        - 'coord=0.82,0.365' -> Maximized window relative ratio (last resort only;
+          handled by find(), never here on its own)
         """
-        base_x, base_y, w, h = self._get_window_geometry()
+        if cand.startswith("coord="):
+            # Coordinates are not resolved by this method. find() handles
+            # them separately, only after all real candidates failed.
+            return None
 
         # 1. Color button locator (SmartVision pixel recognition)
         if cand.startswith("color="):
+            if deadline is not None and time.monotonic() > deadline:
+                return None
             rest = cand[6:]
             color_type, region_str = rest.split(":", 1) if ":" in rest else (rest, None)
             region = None
@@ -80,7 +105,13 @@ class SmartLocator:
                 import pywinauto
                 app = pywinauto.Desktop(backend="uia")
                 win = app.window(handle=self.hwnd)
-                ctrl = win.child_window(title_re=f".*{title}.*", control_type=ctrl_type)
+                # Escape regex metacharacters in the title: the old code
+                # interpolated the raw title into title_re, so a title
+                # containing e.g. '(' or '+' either broke matching or
+                # matched the wrong control.
+                ctrl = win.child_window(
+                    title_re=f".*{re.escape(title)}.*", control_type=ctrl_type
+                )
                 if ctrl.exists(timeout=timeout):
                     rect = ctrl.rectangle()
                     cx = int((rect.left + rect.right) / 2)
@@ -89,33 +120,67 @@ class SmartLocator:
             except Exception:
                 pass
 
-        # 3. Normalized coordinate ratio anchor on maximized window
-        if cand.startswith("coord="):
-            parts = cand[6:].split(",")
-            if len(parts) == 2:
-                rx, ry = float(parts[0]), float(parts[1])
-                x = int(base_x + w * rx)
-                y = int(base_y + h * ry)
-                return (x, y)
+        return None
 
+    def _resolve_coord(self, cand: str) -> Optional[Tuple[int, int]]:
+        """Resolve a coord= candidate. Only called as a last resort by find()."""
+        if not cand.startswith("coord="):
+            return None
+        base_x, base_y, w, h = self._get_window_geometry()
+        parts = cand[6:].split(",")
+        if len(parts) == 2:
+            rx, ry = float(parts[0]), float(parts[1])
+            x = int(base_x + w * rx)
+            y = int(base_y + h * ry)
+            return (x, y)
         return None
 
     def find(self, candidates: List[str], timeout: float = 1.5) -> Tuple[Tuple[int, int], str]:
         """
         Iterate over ranked candidates. Return (screen_coordinates, winning_candidate_string).
+
+        Colour/UIA candidates are tried first, within the timeout.
+        coord= candidates are tried LAST and only if no real candidate
+        resolved. A coord win is still returned, but callers must verify
+        after clicking - it proves nothing about what is on screen.
         """
+        deadline = time.monotonic() + max(0.1, timeout)
         ranked_candidates = agent_memory.rank(self.step_name, candidates)
         last_err = None
 
+        # Pass 1: real (colour / UIA) candidates, respecting the timeout.
+        coord_candidates: List[str] = []
         for cand in ranked_candidates:
+            if cand.startswith("coord="):
+                coord_candidates.append(cand)
+                continue
             key = f"{self.step_name}|{cand}"
             try:
-                coords = self._resolve_candidate(cand, timeout=timeout)
+                coords = self._resolve_candidate(cand, timeout=timeout, deadline=deadline)
                 if coords:
                     agent_memory.record(key, True)
                     return coords, cand
-                else:
-                    agent_memory.record(key, False)
+                agent_memory.record(key, False)
+            except Exception as e:
+                agent_memory.record(key, False)
+                last_err = e
+            if time.monotonic() > deadline:
+                break
+
+        # Pass 2 (last resort only): coordinates. These always "resolve",
+        # so they must never shadow a real candidate or mask a failure.
+        for cand in coord_candidates:
+            key = f"{self.step_name}|{cand}"
+            try:
+                coords = self._resolve_coord(cand)
+                if coords:
+                    logger.warning(
+                        "[%s] No colour/UIA candidate resolved; falling back to "
+                        "last-resort coordinates %s - caller must verify after clicking.",
+                        self.step_name, cand,
+                    )
+                    agent_memory.record(key, True)
+                    return coords, cand
             except Exception as e:
                 agent_memory.record(key, False)
                 last_err = e

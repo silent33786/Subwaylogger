@@ -14,8 +14,13 @@ import time
 import logging
 from typing import Optional, Callable, Dict, Any, List
 from pathlib import Path
-import win32gui
-import win32con
+
+try:
+    import win32gui
+    import win32con
+except ImportError:  # pywin32 not installed / not Windows: guarded at call time.
+    win32gui = None  # type: ignore[assignment]
+    win32con = None  # type: ignore[assignment]
 
 from firefox_manager.config.settings import settings
 from firefox_manager.database.database import db
@@ -44,7 +49,6 @@ from firefox_manager.automation.ad_pipeline_steps import (
     StepContext,
     BaseAdStep,
     EU_COUNTRIES,
-    RANDOM_PAYEE_NAMES,
 )
 
 logger = logging.getLogger("AutoAdsEngine")
@@ -94,6 +98,9 @@ class FacebookAutoAdsEngine:
         Maximize Firefox window to ensure standard, consistent layout across all profiles.
         Eliminates variable window size bugs.
         """
+        if win32gui is None or win32con is None:
+            logger.warning("Cannot maximize window: Windows + pywin32 are unavailable.")
+            return
         try:
             win32gui.ShowWindow(hwnd, win32con.SW_MAXIMIZE)
             time.sleep(0.5)
@@ -107,6 +114,8 @@ class FacebookAutoAdsEngine:
         Navigate native Firefox to a specific URL using Alt+D.
         Universal address bar focus shortcut that works from any DOM / dialog focus.
         """
+        if system_automation.user32 is None:
+            raise RuntimeError("URL navigation needs Windows (Win32 input APIs).")
         system_automation.force_focus_window(hwnd)
         time.sleep(0.3)
 
@@ -126,12 +135,34 @@ class FacebookAutoAdsEngine:
     def wait_for_page_ready(
         self, seconds: float = 5.0, log_step: Optional[Callable[[str], None]] = None
     ) -> None:
-        """Wait for page content to load while checking for stop/pause signals."""
-        steps = int(seconds / 0.5)
+        """Wait for page content to load while checking for stop/pause signals.
+
+        Was: a blind sleep for the whole duration. Now it polls the
+        window title every 0.5s and returns early once the title is
+        stable and non-empty for two consecutive polls (a real readiness
+        signal in native mode, where there is no DOM access). It still
+        waits the full duration if the title never settles.
+        """
+        steps = int(max(0.5, seconds) / 0.5)
+        stable_polls = 0
+        last_title = None
         for _ in range(max(1, steps)):
             if log_step:
                 self._check_interruption(log_step)
             time.sleep(0.5)
+            hwnd = self.current_hwnd
+            if hwnd:
+                try:
+                    title = system_automation.get_window_title(hwnd).strip()
+                except Exception:
+                    title = ""
+                if title and title == last_title:
+                    stable_polls += 1
+                    if stable_polls >= 2:
+                        return
+                elif title:
+                    stable_polls = 0
+                last_title = title if title else last_title
 
     def check_for_human_challenge(self, hwnd: int, log_step: Callable[[str], None]) -> bool:
         """
@@ -156,6 +187,8 @@ class FacebookAutoAdsEngine:
 
     def scroll_mouse(self, hwnd: int, x_screen: int, y_screen: int, ticks: int) -> None:
         """Scroll mouse wheel up (positive ticks) or down (negative ticks)."""
+        if system_automation.user32 is None:
+            raise RuntimeError("Scrolling needs Windows (Win32 input APIs).")
         system_automation.force_focus_window(hwnd)
         system_automation.user32.SetCursorPos(x_screen, y_screen)
         time.sleep(0.15)
@@ -270,7 +303,13 @@ class FacebookAutoAdsEngine:
             last_fix: Optional[str] = None
             max_tries = getattr(config, "max_retries_per_step", 3)
 
-            for attempt in range(1, max_tries + 1):
+            # Retry loop. Human-challenge / policy / security pauses do
+            # NOT consume a retry attempt: the old `for attempt in ...`
+            # loop used `continue` for a pause, which advanced the loop
+            # and burned one of the 3 attempts for merely waiting on the
+            # user. Only a genuine failure increments `attempt`.
+            attempt = 1
+            while attempt <= max_tries:
                 self._check_interruption(log_step)
                 try:
                     if attempt > 1:
@@ -297,7 +336,7 @@ class FacebookAutoAdsEngine:
                     system_automation.force_focus_window(hwnd)
                     self.pause()
                     self._check_interruption(log_step)
-                    continue
+                    continue  # attempt unchanged: waiting on the user is not a failure
 
                 except PolicyRestrictionError as pre:
                     agent_recovery.capture_diagnostic_shot(hwnd, f"{step.name}_policy_restriction")
@@ -306,7 +345,7 @@ class FacebookAutoAdsEngine:
                     system_automation.force_focus_window(hwnd)
                     self.pause()
                     self._check_interruption(log_step)
-                    continue
+                    continue  # attempt unchanged
 
                 except Exception as err:
                     if last_fix:
@@ -325,14 +364,14 @@ class FacebookAutoAdsEngine:
                         system_automation.force_focus_window(hwnd)
                         self.pause()
                         self._check_interruption(log_step)
-                        continue
+                        continue  # attempt unchanged: waiting on the user is not a failure
 
                     if failure_kind == "logged_out":
                         raise RuntimeError(
                             f"Profile '{config.profile_id}' is logged out. Please log in inside Firefox."
                         )
 
-                    # Apply learned recovery fix
+                    # Apply learned recovery fix, then consume this attempt.
                     if attempt < max_tries:
                         last_fix = agent_recovery.execute_ranked_recovery(
                             step_name=step.name,
@@ -340,6 +379,7 @@ class FacebookAutoAdsEngine:
                             attempt=attempt,
                             log_step=log_step,
                         )
+                    attempt += 1
 
             if not step_success:
                 raise RuntimeError(
@@ -354,10 +394,12 @@ class FacebookAutoAdsEngine:
         if has_challenge:
             log_step("⏳ Automation paused. Complete verification or payment setup in Firefox.")
             return {
-                "success": True,
+                # Was success=True with "Ad submitted!" - a lie: nothing
+                # was submitted, the run is only paused. Now success=False.
+                "success": False,
                 "paused": True,
                 "profile_id": config.profile_id,
-                "message": "Ad submitted! Action required: Complete verification or payment in the open Firefox window.",
+                "message": "Paused for verification/payment - ad NOT submitted. Complete it in Firefox, then resume.",
                 "memory_stats": mem_stats,
             }
 

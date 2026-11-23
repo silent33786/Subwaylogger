@@ -7,11 +7,16 @@ Features:
 4. Self-learning ranked recovery routines (popup dismissal, overlay escape, scroll, reload)
 """
 
+import sys
 import time
 import logging
 from pathlib import Path
 from typing import Optional, Callable, Dict, Any, List
-import win32gui
+
+try:
+    import win32gui
+except ImportError:  # pywin32 not installed / not Windows: guarded at call time.
+    win32gui = None  # type: ignore[assignment]
 
 from firefox_manager.config.settings import settings
 from firefox_manager.authentication.system_automation import (
@@ -154,6 +159,8 @@ class AdAgentRecovery:
 
     def scroll_down(self, hwnd: int, log_step: Optional[Callable[[str], None]] = None) -> bool:
         """Scroll down smoothly to reveal off-screen form inputs."""
+        if win32gui is None or system_automation.user32 is None:
+            raise RuntimeError("Scrolling needs Windows + pywin32.")
         if log_step:
             log_step("🛡️ Recovery: Scrolling Firefox viewport down...")
         rect = win32gui.GetWindowRect(hwnd)
@@ -170,6 +177,8 @@ class AdAgentRecovery:
 
     def scroll_up(self, hwnd: int, log_step: Optional[Callable[[str], None]] = None) -> bool:
         """Scroll up smoothly."""
+        if win32gui is None or system_automation.user32 is None:
+            raise RuntimeError("Scrolling needs Windows + pywin32.")
         if log_step:
             log_step("🛡️ Recovery: Scrolling Firefox viewport up...")
         rect = win32gui.GetWindowRect(hwnd)

@@ -4,6 +4,7 @@ Tracks active Firefox processes, CPU/Memory metrics, crash detection,
 and enforces concurrent execution limits.
 """
 
+import sys
 import time
 import subprocess
 import threading
@@ -242,14 +243,17 @@ class ProcessManager:
                 except Exception:
                     pass
 
-        # Sweep any stray firefox processes associated with managed profiles
+        # Sweep stray Firefox processes ONLY if their command line points
+        # inside the managed profiles_dir. The old code also killed any
+        # process whose cmdline merely contained "-profile", which could
+        # kill the user's unrelated Firefox profiles.
         try:
-            profiles_str = str(settings.profiles_dir).lower()
+            profiles_str = str(settings.profiles_dir.resolve()).lower()
             for proc in psutil.process_iter(["pid", "name", "cmdline"]):
                 try:
                     if proc.info.get("name") and "firefox" in proc.info["name"].lower():
                         cmdline = " ".join(proc.info.get("cmdline") or []).lower()
-                        if profiles_str in cmdline or "-profile" in cmdline:
+                        if profiles_str in cmdline:
                             proc.kill()
                 except Exception:
                     pass
